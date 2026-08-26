@@ -250,16 +250,25 @@ done
 say "     $OK file(s) served correctly, $BAD still failing"
 [ "$OK" -eq 0 ] && warn "the page did not ask for any files - it may still be serving a cached copy"
 
-LOGIN=$(curl -s -o /dev/null -w '%{http_code}' --max-time 20 "$BASE/login")
-say "     /login answers $LOGIN  (200 means the security fix is now live)"
-[ "$LOGIN" = "200" ] || warn "/login answers $LOGIN, so the new code is still not the one running"
-
+# The sign-in screen is part of the main page - there is no /login address,
+# so asking for one proves nothing. What proves the new code is running is
+# that the API refuses an anonymous caller, and that the Email Validator
+# address exists at all.
 VMS=$(curl -s -o /dev/null -w '%{http_code}' --max-time 20 "$BASE/api/vms")
 say "     /api/vms without signing in answers $VMS  (401 is what we want)"
 case "$VMS" in
   401|403|302|307) : ;;
-  *) warn "/api/vms still answers $VMS without a login - your VM list is public" ;;
+  200) warn "/api/vms still answers 200 without a login - your VM list is public, the security fix is not running" ;;
+  *)   warn "/api/vms answers $VMS, which is neither locked nor working" ;;
 esac
+
+EV=$(curl -s -o /dev/null -w '%{http_code}' --max-time 20 "$BASE/api/email-validator")
+say "     Email Validator answers $EV  (404 would mean it is not deployed)"
+[ "$EV" = "404" ] && warn "the Email Validator is not in the running build"
+
+LOGIN=$(curl -s -o /dev/null -w '%{http_code}' --max-time 20 "$BASE/")
+say "     the panel's own page answers $LOGIN"
+[ "$LOGIN" = "200" ] || warn "the panel's main page answers $LOGIN"
 
 # ------------------------------------------------------------- summary
 say ""
@@ -269,7 +278,7 @@ if [ "$BAD" -eq 0 ] && [ "$OK" -gt 0 ] && [ "$LOGIN" = "200" ] && [ -z "$WARN" ]
   say "Open the panel and sign in. It asks once now, not on every refresh."
   say "Email Validator is in the left menu, under Golden Backups."
 else
-  say "PARTLY FIXED - $OK files served, $BAD failing, /login answers $LOGIN."
+  say "PARTLY FIXED - $OK files served, $BAD failing."
   [ -n "$WARN" ] && { say "Still wrong:"; echo "$WARN" | sed '/^$/d' | tee -a "$REPORT"; }
   say "Send me /tmp/panel-report.txt"
 fi
