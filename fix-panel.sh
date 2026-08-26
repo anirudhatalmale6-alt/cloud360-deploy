@@ -1,13 +1,18 @@
 #!/bin/sh
-# Cloud360 panel - the page loads but stays blank.
+# Cloud360 panel - the page loads but stays blank.  ROUND 2.
 #
-# Every stylesheet and script the page asks for is coming back as
-# "Internal Server Error", so the browser gets an empty shell and nothing to
-# draw with. This script says WHY first, then repairs it, then proves the
-# repair worked before it finishes.
+# Round 1 told us two things:
+#   * .next/static had 3 files in it and no code chunks at all, so the browser
+#     was asking for files that were not there.
+#   * the panel's own log ends in EADDRINUSE - it could not start because
+#     something else was already holding its port. That is why restarting it
+#     changed nothing: the old copy never let go.
 #
-# It checks there is room to work before it changes anything.
-# Safe to run more than once.
+# So this one frees the port first, builds from scratch, refuses to restart
+# unless the build actually produced the files, and then proves it.
+#
+# Safe to run more than once. Nothing is deleted except the build folder,
+# which is regenerated.
 
 REPORT=/tmp/panel-report.txt
 : > "$REPORT"
@@ -16,11 +21,15 @@ say()  { echo "$@"; echo "$@" >> "$REPORT"; }
 hide() { sed -E 's/gh[pous]_[A-Za-z0-9_]*/HIDDEN/g'; }
 quote(){ hide | sed 's/^/     | /' | tee -a "$REPORT"; }
 
-say "==== Cloud360 panel repair - $(date) ===="
+WARN=""
+warn() { WARN="$WARN
+  - $1"; }
+
+say "==== Cloud360 panel repair, round 2 - $(date) ===="
 say ""
 
 # ---------------------------------------------------------------- find it
-say "1/7  finding the panel folder ..."
+say "1/9  finding the panel folder"
 DIR=""
 for base in /opt /root /home /srv /var/www /usr/local; do
   [ -d "$base" ] || continue
@@ -28,164 +37,240 @@ for base in /opt /root /home /srv /var/www /usr/local; do
   if [ -n "$F" ] && [ -f "$(dirname "$F")/server.js" ]; then DIR=$(dirname "$F"); break; fi
 done
 if [ -z "$DIR" ]; then
-  say "REPORT BACK - could not find the panel folder automatically."
+  say "REPORT BACK - could not find the panel folder."
   exit 1
 fi
 OWNER=$(stat -c %U "$DIR")
 GROUP=$(stat -c %G "$DIR")
-say "     found $DIR   (owned by $OWNER)"
+say "     $DIR   (owned by $OWNER)"
 cd "$DIR" || exit 1
 
 asowner() { runuser -l "$OWNER" -c "cd '$DIR' && $1"; }
+PM2="npx --yes pm2"
 
-# ------------------------------------------------------------- what is wrong
-say ""
-say "2/7  what the box looks like right now"
-say "     disk free   $(df -Ph . | awk 'NR==2{print $4" of "$2" ("$5" used)"}')"
-say "     memory      $(free -m | awk '/^Mem/{print $7" MB available of "$2" MB"}')"
-say "     swap        $(free -m | awk '/^Swap/{print $2" MB"}')"
-say "     node        $(asowner 'node -v' 2>/dev/null || echo unknown)"
-say "     commit      $(git rev-parse --short HEAD 2>/dev/null || echo 'not a git checkout')"
+PORT=$(grep -oE "PORT \|\| '[0-9]+'" server.js 2>/dev/null | grep -oE '[0-9]+' | head -1)
+[ -z "$PORT" ] && PORT=3000
+say "     the panel is supposed to listen on port $PORT"
 
+# ------------------------------------------------------- who has the port
 say ""
-say "3/7  the built files the browser is asking for"
-if [ -d .next ]; then
-  say "     .next          $(stat -c '%U:%G %a' .next)"
-else
-  say "     .next          MISSING"
+say "2/9  what is running right now"
+$PM2 list 2>/dev/null | sed -n '3,20p' | quote
+
+say "     processes holding port $PORT:"
+HOLDERS=""
+if command -v ss >/dev/null 2>&1; then
+  HOLDERS=$(ss -lptnH "sport = :$PORT" 2>/dev/null | grep -oE 'pid=[0-9]+' | cut -d= -f2 | sort -u)
 fi
-if [ -d .next/static ]; then
-  say "     .next/static   $(stat -c '%U:%G %a' .next/static), $(find .next/static -type f 2>/dev/null | wc -l) files"
-  CH=$(find .next/static -name 'webpack-*.js' 2>/dev/null | head -1)
-  if [ -n "$CH" ]; then
-    say "     sample chunk   $CH"
-    say "                    $(stat -c '%U:%G %a  %s bytes' "$CH")"
-    [ -L "$CH" ] && say "                    IS A SYMLINK -> $(readlink "$CH")"
-  else
-    say "     sample chunk   none found under .next/static"
-  fi
-else
-  say "     .next/static   MISSING  <-- this alone explains a blank page"
+if [ -z "$HOLDERS" ] && command -v lsof >/dev/null 2>&1; then
+  HOLDERS=$(lsof -t -i ":$PORT" -sTCP:LISTEN 2>/dev/null | sort -u)
 fi
-[ -d .next/standalone ] && say "     .next/standalone exists - the server may be serving from there instead"
-
-say ""
-say "4/7  what the panel process itself logged"
-LOGS=$(ls -1t "/home/$OWNER/.pm2/logs/"*error*.log /root/.pm2/logs/*error*.log 2>/dev/null | head -1)
-if [ -n "$LOGS" ] && [ -f "$LOGS" ]; then
-  say "     from $LOGS"
-  tail -n 25 "$LOGS" | quote
+if [ -z "$HOLDERS" ]; then
+  say "       (nothing is listening - the panel is down, not just blank)"
 else
-  say "     no pm2 error log found - skipping"
+  for p in $HOLDERS; do
+    say "       pid $p  started $(ps -o lstart= -p "$p" 2>/dev/null | tr -s ' ')"
+    say "         running from  $(readlink -f "/proc/$p/cwd" 2>/dev/null)"
+    say "         command       $(tr '\0' ' ' < "/proc/$p/cmdline" 2>/dev/null | cut -c1-90)"
+  done
 fi
 
-# ------------------------------------------------------------------ repair
+# ------------------------------------------------- the login credentials
+# After the security fix the panel signs you in with a real session, and the
+# key it signs with comes from PANEL_SECRET, or from PANEL_USER/PANEL_PASS.
+# If none of those reach the process, every login fails - so check BEFORE
+# restarting rather than discovering it afterwards.  Names only, never values.
 say ""
-say "5/7  rebuilding"
+say "3/9  the login settings the panel needs"
+FOUND_KEYS=""
+for f in .env.local .env.production .env; do
+  [ -f "$f" ] || continue
+  K=$(grep -oE '^[A-Z0-9_]+' "$f" | tr '\n' ' ')
+  say "     $f holds: $K"
+  FOUND_KEYS="$FOUND_KEYS $K"
+done
+if [ -n "$HOLDERS" ]; then
+  for p in $HOLDERS; do
+    K=$(tr '\0' '\n' < "/proc/$p/environ" 2>/dev/null | grep -oE '^(PANEL_[A-Z]+|PROXMOX_[A-Z_]+|WASABI_[A-Z_]+|NODE_ENV|PORT)' | tr '\n' ' ')
+    [ -n "$K" ] && { say "     the running process has: $K"; FOUND_KEYS="$FOUND_KEYS $K"; }
+    NE=$(tr '\0' '\n' < "/proc/$p/environ" 2>/dev/null | grep '^NODE_ENV=' | cut -d= -f2)
+    [ -n "$NE" ] && say "     NODE_ENV is currently '$NE'"
+    break
+  done
+fi
+case " $FOUND_KEYS " in
+  *" PANEL_SECRET "*|*" PANEL_PASS "*) say "     OK - the panel has something to sign sessions with." ;;
+  *) say "     PROBLEM - no PANEL_SECRET and no PANEL_PASS anywhere."
+     say "     The new login will refuse everyone until one of them is set."
+     warn "no PANEL_SECRET / PANEL_PASS found - you will not be able to log in" ;;
+esac
+
+# --------------------------------------------------------------- headroom
+say ""
+say "4/9  room to work"
+say "     disk    $(df -Ph . | awk 'NR==2{print $4" free of "$2}')"
+say "     memory  $(free -m | awk '/^Mem/{print $7" MB available of "$2" MB"}')"
+say "     node    $(node -v 2>/dev/null || echo unknown)"
 FREE_KB=$(df -Pk . | awk 'NR==2{print $4}')
 if [ "$FREE_KB" -lt 2097152 ]; then
   say ""
-  say "REPORT BACK - only $((FREE_KB/1024)) MB free. A rebuild needs about 2 GB."
-  say "Nothing was changed. Send me /tmp/panel-report.txt and I will clear space first."
+  say "REPORT BACK - only $((FREE_KB/1024)) MB free, a build needs about 2 GB."
+  say "Nothing was changed. Send me /tmp/panel-report.txt"
   exit 1
 fi
 
+# ------------------------------------------------------- stop it properly
+say ""
+say "5/9  stopping the old copy and freeing port $PORT"
+$PM2 stop cloud360-panel >/dev/null 2>&1
+$PM2 delete cloud360-panel >/dev/null 2>&1
+sleep 2
+# Anything still sitting on the port is an orphan from an earlier start. It is
+# the reason the managed copy could never boot, so it has to go. Only node
+# processes are touched.
+STILL=$(ss -lptnH "sport = :$PORT" 2>/dev/null | grep -oE 'pid=[0-9]+' | cut -d= -f2 | sort -u)
+[ -z "$STILL" ] && command -v lsof >/dev/null 2>&1 && STILL=$(lsof -t -i ":$PORT" -sTCP:LISTEN 2>/dev/null | sort -u)
+for p in $STILL; do
+  EXE=$(readlink -f "/proc/$p/exe" 2>/dev/null)
+  case "$EXE" in
+    *node*) say "     ending orphan pid $p ($EXE)"; kill "$p" 2>/dev/null; sleep 3; kill -9 "$p" 2>/dev/null ;;
+    *)      say "     leaving pid $p alone - it is not node, it is $EXE"
+            warn "port $PORT is held by something that is not the panel: $EXE" ;;
+  esac
+done
+sleep 2
+LEFT=$(ss -lptnH "sport = :$PORT" 2>/dev/null | wc -l)
+say "     port $PORT is now $([ "$LEFT" -eq 0 ] && echo free || echo STILL TAKEN)"
+
+# ------------------------------------------------------------ build clean
+say ""
+say "6/9  building the panel from scratch"
 if [ -d .git ] && [ -n "$(git remote 2>/dev/null)" ]; then
   git config --global --add safe.directory "$DIR" >/dev/null 2>&1
   BEFORE=$(git rev-parse --short HEAD 2>/dev/null)
   if asowner 'git pull --ff-only' > /tmp/panel-pull.log 2>&1; then
     say "     code $BEFORE -> $(git rev-parse --short HEAD)"
   else
-    say "     could not update the code, rebuilding what is already here. Reason:"
-    tail -n 5 /tmp/panel-pull.log | quote
+    say "     could not update the code, using what is already here ($BEFORE). Reason:"
+    tail -n 4 /tmp/panel-pull.log | quote
   fi
 fi
 
-# A Next build wants more heap than the default on a small box. Give it what
-# the machine actually has, rather than letting it die half way and leave
-# behind the half-built folder that produces exactly this blank page.
+[ -d node_modules ] || asowner 'npm install --no-audit --no-fund' > /tmp/panel-build.log 2>&1
+
+# A half-finished build folder is exactly what was on this box, and Next will
+# happily build on top of one and leave the gaps in place. Start empty.
+rm -rf .next
+say "     old build folder cleared"
+
 MEM_MB=$(free -m | awk '/^Mem/{print $2}')
 HEAP=$((MEM_MB * 3 / 4))
 [ "$HEAP" -lt 1024 ] && HEAP=1024
 [ "$HEAP" -gt 4096 ] && HEAP=4096
-say "     building with a ${HEAP} MB heap limit ..."
+say "     building with a ${HEAP} MB memory limit ..."
 
-BUILD="NODE_OPTIONS=--max-old-space-size=$HEAP npx --yes next build"
+BUILD="NODE_ENV=production NODE_OPTIONS=--max-old-space-size=$HEAP npx --yes next build"
 if asowner "$BUILD" > /tmp/panel-build.log 2>&1; then
-  say "     build OK"
+  say "     build finished"
 else
-  say "     first attempt failed, installing dependencies and trying once more ..."
+  say "     first attempt failed, reinstalling dependencies and trying again ..."
   asowner 'npm install --no-audit --no-fund' >> /tmp/panel-build.log 2>&1
   if asowner "$BUILD" >> /tmp/panel-build.log 2>&1; then
-    say "     build OK on the second attempt"
+    say "     build finished on the second attempt"
   else
     say ""
-    say "REPORT BACK - the rebuild failed. Last lines were:"
+    say "REPORT BACK - the build failed. It ended with:"
     tail -n 25 /tmp/panel-build.log | quote
     say ""
-    say "Send me /tmp/panel-report.txt"
+    say "Send me /tmp/panel-report.txt - the panel was left stopped."
     exit 1
   fi
 fi
 
-# A build run as root leaves files the panel's own user cannot read, which is
-# itself a way to produce this same blank page. Put the ownership back.
+# ------------------------------------------------- check the build is real
+# Round 1 restarted whatever the build left behind. That was the mistake:
+# a build can exit 0 and still leave nothing to serve. Count the files.
+say ""
+say "7/9  checking the build actually produced the browser's files"
+CHUNKS=$(find .next/static/chunks -type f -name '*.js' 2>/dev/null | wc -l)
+CSS=$(find .next/static/css -type f -name '*.css' 2>/dev/null | wc -l)
+TOTAL=$(find .next/static -type f 2>/dev/null | wc -l)
+say "     $CHUNKS javascript chunks, $CSS stylesheets, $TOTAL files in total"
+if [ "$CHUNKS" -lt 5 ]; then
+  say ""
+  say "REPORT BACK - the build says it worked but produced almost nothing."
+  say "This is the same fault as before and the cause is in the build log."
+  tail -n 30 /tmp/panel-build.log | quote
+  say ""
+  say "Send me /tmp/panel-report.txt - the panel was left stopped."
+  exit 1
+fi
+
 chown -R "$OWNER":"$GROUP" .next 2>/dev/null
 find .next -type d -exec chmod 755 {} + 2>/dev/null
 find .next -type f -exec chmod 644 {} + 2>/dev/null
-
-# Standalone builds keep the server in .next/standalone and do NOT copy the
-# static files across. If that layout is in use, copy them.
 if [ -d .next/standalone ]; then
   mkdir -p .next/standalone/.next
   cp -r .next/static .next/standalone/.next/ 2>/dev/null
   [ -d public ] && cp -r public .next/standalone/ 2>/dev/null
   chown -R "$OWNER":"$GROUP" .next/standalone 2>/dev/null
-  say "     standalone layout - static files copied across"
+  say "     standalone layout - files copied across"
 fi
 
+# ------------------------------------------------------------- start it
 say ""
-say "6/7  restarting the panel"
-asowner 'npx --yes pm2 restart cloud360-panel --update-env' >/dev/null 2>&1 \
-  || asowner 'npx --yes pm2 start server.js --name cloud360-panel' >/dev/null 2>&1 \
-  || npx --yes pm2 restart cloud360-panel >/dev/null 2>&1 \
-  || say "     REPORT BACK - could not restart it automatically."
-sleep 6
+say "8/9  starting the panel"
+asowner "NODE_ENV=production PORT=$PORT $PM2 start server.js --name cloud360-panel --update-env" >/dev/null 2>&1 \
+  || NODE_ENV=production PORT=$PORT $PM2 start server.js --name cloud360-panel --update-env >/dev/null 2>&1 \
+  || say "     REPORT BACK - could not start it."
+$PM2 save >/dev/null 2>&1
+sleep 8
+say "     $($PM2 list 2>/dev/null | grep -c 'cloud360-panel') copy running (there should be exactly 1)"
 
-# ------------------------------------------------------------------ prove it
+# ------------------------------------------------------------- prove it
 say ""
-say "7/7  checking the browser will actually get its files now"
-PORT=""
-for p in 3000 3001 8080 8000; do
-  curl -s -o /dev/null --max-time 5 "http://127.0.0.1:$p/" && { PORT=$p; break; }
-done
-if [ -z "$PORT" ]; then
-  say "     REPORT BACK - the panel is not answering on this box at all."
-  say "     Send me /tmp/panel-report.txt"
+say "9/9  proving the browser gets what it asks for"
+BASE="http://127.0.0.1:$PORT"
+HOME_CODE=$(curl -s -o /dev/null -w '%{http_code}' --max-time 25 "$BASE/")
+if [ "$HOME_CODE" != "200" ] && [ "$HOME_CODE" != "307" ] && [ "$HOME_CODE" != "302" ]; then
+  say "     the panel answered $HOME_CODE on its own address. Its log says:"
+  L=$(ls -1t "/home/$OWNER/.pm2/logs/"*cloud360-panel-error*.log /root/.pm2/logs/*cloud360-panel-error*.log 2>/dev/null | head -1)
+  [ -n "$L" ] && tail -n 20 "$L" | quote
+  say ""
+  say "REPORT BACK - send me /tmp/panel-report.txt"
   exit 1
 fi
-BASE="http://127.0.0.1:$PORT"
-say "     panel answering on port $PORT"
 
-HTML=$(curl -s --max-time 20 "$BASE/")
+HTML=$(curl -sL --max-time 25 "$BASE/")
 OK=0; BAD=0
 for u in $(echo "$HTML" | grep -oE '(src|href)="/_next/[^"]+"' | cut -d'"' -f2 | sort -u); do
-  CODE=$(curl -s -o /dev/null -w '%{http_code}' --max-time 20 "$BASE$u")
-  if [ "$CODE" = "200" ]; then
-    OK=$((OK+1))
-  else
-    BAD=$((BAD+1)); say "     STILL BROKEN  $CODE  $u"
-  fi
+  CODE=$(curl -s -o /dev/null -w '%{http_code}' --max-time 25 "$BASE$u")
+  if [ "$CODE" = "200" ]; then OK=$((OK+1)); else BAD=$((BAD+1)); say "     STILL BROKEN  $CODE  $u"; fi
 done
 say "     $OK file(s) served correctly, $BAD still failing"
+[ "$OK" -eq 0 ] && warn "the page did not ask for any files - it may still be serving a cached copy"
 
+LOGIN=$(curl -s -o /dev/null -w '%{http_code}' --max-time 20 "$BASE/login")
+say "     /login answers $LOGIN  (200 means the security fix is now live)"
+[ "$LOGIN" = "200" ] || warn "/login answers $LOGIN, so the new code is still not the one running"
+
+VMS=$(curl -s -o /dev/null -w '%{http_code}' --max-time 20 "$BASE/api/vms")
+say "     /api/vms without signing in answers $VMS  (401 is what we want)"
+case "$VMS" in
+  401|403|302|307) : ;;
+  *) warn "/api/vms still answers $VMS without a login - your VM list is public" ;;
+esac
+
+# ------------------------------------------------------------- summary
 say ""
-if [ "$BAD" -eq 0 ] && [ "$OK" -gt 0 ]; then
-  say "FIXED. Open the panel and sign in. It asks for the password once now"
-  say "instead of on every refresh."
+say "-------------------- COPY FROM HERE --------------------"
+if [ "$BAD" -eq 0 ] && [ "$OK" -gt 0 ] && [ "$LOGIN" = "200" ] && [ -z "$WARN" ]; then
+  say "FIXED. $OK files served, login is live, the VM list is no longer public."
+  say "Open the panel and sign in. It asks once now, not on every refresh."
   say "Email Validator is in the left menu, under Golden Backups."
 else
-  say "REPORT BACK - still broken. Send me /tmp/panel-report.txt"
+  say "PARTLY FIXED - $OK files served, $BAD failing, /login answers $LOGIN."
+  [ -n "$WARN" ] && { say "Still wrong:"; echo "$WARN" | sed '/^$/d' | tee -a "$REPORT"; }
+  say "Send me /tmp/panel-report.txt"
 fi
-say ""
-say "(a copy of everything above is saved at /tmp/panel-report.txt)"
+say "--------------------- TO HERE --------------------------"
