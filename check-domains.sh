@@ -30,10 +30,22 @@ fi
 command -v nginx >/dev/null 2>&1 || { echo "nginx is not on this machine - wrong server."; exit 1; }
 
 MYIP=$(curl -s --max-time 15 https://api.ipify.org 2>/dev/null)
-echo "This server is ${MYIP:-unknown}"
-echo
+echo "This server is $(hostname), going out as ${MYIP:-unknown}"
 
 CONF=$(sudo nginx -T 2>/dev/null)
+
+# Say plainly whether this is the box that matters. Run on the wrong machine,
+# every verdict below would be technically true and completely misleading:
+# nothing is configured here, so everything reads as MISSING.
+if printf '%s\n' "$CONF" | grep -q 'agbuysell\|liquoronline'; then
+  echo "This is the reverse proxy - the verdicts below are about the live estate."
+else
+  echo
+  echo "WARNING: this machine does not serve the estate's sites, so it is not the"
+  echo "reverse proxy. Everything below will read as missing simply because it is"
+  echo "not configured here. Log in to the machine whose prompt reads nginx-mern."
+fi
+echo
 
 # Pull out every name nginx actually serves, one per line. Not a grep for the
 # domain against the raw config: server_name is not always the first thing on

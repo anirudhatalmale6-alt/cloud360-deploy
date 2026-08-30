@@ -17,10 +17,16 @@
 # yet - so re-running it can never drop the site back to "Not secure", and can
 # never burn through Let's Encrypt's five-per-week limit.
 #
-# Order matters. The DNS A record has to be pointing here BEFORE you run this,
-# because Let's Encrypt proves you own the domain by fetching a file from it.
-# The script checks that first and stops with an explanation if it is not ready,
-# without having changed anything.
+# It checks, in this order and stopping at the first failure without having
+# changed anything:
+#
+#   1. that this really is the machine serving the site you named - if it is
+#      not, it says so and tells you nothing else, because advice from the wrong
+#      machine is worse than no advice;
+#   2. that the app behind that site is actually up;
+#   3. that the domain's DNS already points at the address this proxy answers
+#      on - Let's Encrypt proves you own the domain by fetching a file from it,
+#      so that has to be true first.
 #
 set -uo pipefail
 
@@ -65,7 +71,69 @@ LINK="$NGINX_DIR/sites-enabled/$NEWDOMAIN.conf"
 LIVE="$LE_DIR/live/$NEWDOMAIN"
 
 # ---------------------------------------------------------------------------
-# 1. Is the DNS actually pointing here yet?
+# 1. Am I even on the right machine?
+#
+# This is deliberately the FIRST thing checked. An earlier version asked about
+# DNS first, was run on the storage box by mistake, and cheerfully advised
+# pointing two live domains at a machine with nothing listening on port 80 -
+# which took them from "wrong site" to "does not load at all". A script that
+# gives instructions has to establish it is qualified to give them.
+#
+# The test is simple and unfakeable: the site we are told already works has to
+# be configured HERE. If it is not, this is not the reverse proxy.
+# ---------------------------------------------------------------------------
+say "Checking this is the machine that serves $TEMPLATE"
+
+SRC=""
+for d in "$NGINX_DIR/sites-enabled" "$NGINX_DIR/sites-available" "$NGINX_DIR/conf.d"; do
+  for f in "$d/$TEMPLATE.conf" "$d/$TEMPLATE"; do
+    [ -f "$f" ] && { SRC="$f"; break 2; }
+  done
+done
+if [ -z "$SRC" ]; then
+  # The file is not named after the site. Find whichever file declares it -
+  # skipping our own output, or re-running this would copy from itself.
+  SRC=$(sudo grep -rls -- "server_name[^;]*$TEMPLATE" "$NGINX_DIR" 2>/dev/null \
+        | grep -v -- "/$NEWDOMAIN.conf$" | head -1)
+fi
+if [ -z "$SRC" ]; then
+  bad "$TEMPLATE is not configured on this machine, so this is the wrong box."
+  note "You are logged in to $(hostname). The reverse proxy is the machine whose"
+  note "prompt reads nginx-mern. Log in to that one and run this again."
+  note ""
+  note "For what it is worth, this machine serves these names:"
+  sudo nginx -T 2>/dev/null | sed 's/#.*//' \
+    | grep -oE 'server_name[[:space:]]+[^;]*' | sed 's/^server_name[[:space:]]*//' \
+    | tr ' \t' '\n\n' | sed '/^$/d' | sort -u | head -20 | sed 's/^/      /'
+  note ""
+  note "Nothing has been changed, and no advice above this line is worth acting on."
+  exit 1
+fi
+ok "Found $SRC"
+
+UPSTREAM=$(sudo grep -hoE 'proxy_pass[[:space:]]+https?://[^;]+' "$SRC" 2>/dev/null | head -1 | awk '{print $2}')
+if [ -z "$UPSTREAM" ]; then
+  bad "That file has no proxy_pass line, so there is nothing to copy."
+  note "Nothing has been changed."
+  exit 1
+fi
+ok "It forwards to $UPSTREAM"
+
+# Prove the upstream is actually alive before pointing a public name at it.
+UP_CODE=$(curl -s -o /dev/null -w '%{http_code}' --max-time 10 \
+          -H "Host: $TEMPLATE" "$UPSTREAM" 2>/dev/null)
+if [ "$UP_CODE" = "000" ]; then
+  bad "$UPSTREAM did not answer at all - the app behind $TEMPLATE looks down."
+  note "Nothing has been changed. Fix the app first, then run this again."
+  exit 1
+fi
+ok "$UPSTREAM answers $UP_CODE"
+
+# ---------------------------------------------------------------------------
+# 2. Is the DNS pointing here yet?
+#
+# Only now, having established this really is the proxy, is it safe to say
+# anything about where a domain should point.
 # ---------------------------------------------------------------------------
 say "Checking that $NEWDOMAIN points at this server"
 
@@ -75,7 +143,20 @@ if [ -z "$MYIP" ]; then
   note "Nothing has been changed."
   exit 1
 fi
-note "this server is $MYIP"
+note "this server goes out as $MYIP"
+
+# Going out as an address is not the same as being reachable at it - a machine
+# behind NAT can have a different address inbound. Before naming that address in
+# an instruction, knock on it from the outside and see if this proxy answers.
+PUB_CODE=$(curl -s -o /dev/null -w '%{http_code}' --max-time 15 \
+           -H "Host: $TEMPLATE" "http://$MYIP/" 2>/dev/null)
+if [ "$PUB_CODE" = "000" ]; then
+  bad "Nothing answers on port 80 at $MYIP, so that is not the address the"
+  note "public reaches this proxy on - do NOT point any domain at it."
+  note "Send me this output and I will find the right address. Nothing changed."
+  exit 1
+fi
+ok "$MYIP answers on port 80, so that is the public address of this proxy"
 
 RESOLVED=$(getent ahostsv4 "$NEWDOMAIN" 2>/dev/null | awk '{print $1}' | sort -u | tr '\n' ' ')
 note "$NEWDOMAIN resolves to ${RESOLVED:-nothing}"
@@ -99,49 +180,6 @@ esac
 
 SERVER_NAMES="$NEWDOMAIN"
 [ "$WWW_OK" = yes ] && SERVER_NAMES="$NEWDOMAIN www.$NEWDOMAIN"
-
-# ---------------------------------------------------------------------------
-# 2. Read the working site's configuration and take its upstream from it.
-# ---------------------------------------------------------------------------
-say "Reading the configuration of $TEMPLATE"
-
-SRC=""
-for d in "$NGINX_DIR/sites-enabled" "$NGINX_DIR/sites-available" "$NGINX_DIR/conf.d"; do
-  for f in "$d/$TEMPLATE.conf" "$d/$TEMPLATE"; do
-    [ -f "$f" ] && { SRC="$f"; break 2; }
-  done
-done
-if [ -z "$SRC" ]; then
-  # The file is not named after the site. Find whichever file declares it -
-  # skipping our own output, or re-running this would copy from itself.
-  SRC=$(sudo grep -rls -- "server_name[^;]*$TEMPLATE" "$NGINX_DIR" 2>/dev/null \
-        | grep -v -- "/$NEWDOMAIN.conf$" | head -1)
-fi
-if [ -z "$SRC" ]; then
-  bad "Could not find an nginx file for $TEMPLATE on this machine."
-  note "Send me the output of:   ls $NGINX_DIR/sites-enabled"
-  note "Nothing has been changed."
-  exit 1
-fi
-ok "Found $SRC"
-
-UPSTREAM=$(sudo grep -hoE 'proxy_pass[[:space:]]+https?://[^;]+' "$SRC" 2>/dev/null | head -1 | awk '{print $2}')
-if [ -z "$UPSTREAM" ]; then
-  bad "That file has no proxy_pass line, so there is nothing to copy."
-  note "Nothing has been changed."
-  exit 1
-fi
-ok "It forwards to $UPSTREAM"
-
-# Prove the upstream is actually alive before pointing a public name at it.
-UP_CODE=$(curl -s -o /dev/null -w '%{http_code}' --max-time 10 \
-          -H "Host: $TEMPLATE" "$UPSTREAM" 2>/dev/null)
-if [ "$UP_CODE" = "000" ]; then
-  bad "$UPSTREAM did not answer at all - the app behind $TEMPLATE looks down."
-  note "Nothing has been changed. Fix the app first, then run this again."
-  exit 1
-fi
-ok "$UPSTREAM answers $UP_CODE"
 
 sudo mkdir -p "$ACME_ROOT/.well-known/acme-challenge"
 sudo chmod -R 755 "$ACME_ROOT"
