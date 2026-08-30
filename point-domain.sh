@@ -2,18 +2,20 @@
 #
 # Point a real domain at a site that is already running on this reverse proxy.
 #
-#   bash point-domain.sh clarityai.ca clarityai.cloud360.ca
-#   bash point-domain.sh getprompthelper.com aiprompthelper.cloud360.ca
+#   bash point-domain.sh clarityai.ca         clarityai.cloud360.ca
+#   bash point-domain.sh getprompthelper.com  aiprompthelper.cloud360.ca
 #
 # The second name is the site that already works. This script does NOT invent a
 # configuration - it reads that site's existing nginx file, takes the address it
 # forwards to, and writes the same thing out again under the new name. So the
 # new domain lands on exactly the site you can already see, not on a guess.
 #
-# Then it asks Let's Encrypt for a certificate and checks the finished result
-# from outside over https.
-#
 # Run it on the reverse proxy (VM 111) as the ubuntu24 user.
+#
+# Safe to run again as many times as you like. It writes the finished http+https
+# configuration itself and only calls Let's Encrypt when there is no certificate
+# yet - so re-running it can never drop the site back to "Not secure", and can
+# never burn through Let's Encrypt's five-per-week limit.
 #
 # Order matters. The DNS A record has to be pointing here BEFORE you run this,
 # because Let's Encrypt proves you own the domain by fetching a file from it.
@@ -37,6 +39,30 @@ if [ -z "$NEWDOMAIN" ] || [ -z "$TEMPLATE" ]; then
 fi
 
 command -v nginx >/dev/null 2>&1 || { bad "nginx is not on this machine - wrong server."; exit 1; }
+
+# Real paths by default. They are overridable only so this script can be run
+# end to end against a throwaway nginx before it is ever pointed at the live
+# proxy - nothing you run by hand needs to set any of them.
+NGINX_DIR="${NGINX_DIR:-/etc/nginx}"
+LE_DIR="${LE_DIR:-/etc/letsencrypt}"
+ACME_ROOT="${ACME_ROOT:-/var/www/acme}"
+NGINX_TEST="${NGINX_TEST:-sudo nginx -t}"
+NGINX_RELOAD="${NGINX_RELOAD:-sudo systemctl reload nginx}"
+
+# nginx changed how http2 is switched on in 1.25. The old spelling is a hard
+# error on new builds and the new one is a hard error on old builds, so ask the
+# binary which it is rather than picking one and hoping. VM 111 is on 1.24.
+NGVER=$(nginx -v 2>&1 | sed -n 's#.*nginx/\([0-9][0-9]*\.[0-9][0-9]*\).*#\1#p')
+NGMAJ=${NGVER%%.*}; NGMIN=${NGVER#*.}
+if [ -n "$NGVER" ] && { [ "${NGMAJ:-0}" -gt 1 ] || [ "${NGMIN:-0}" -ge 25 ]; }; then
+  LISTEN_HTTP2=""; HTTP2_DIRECTIVE='echo "    http2 on;"'
+else
+  LISTEN_HTTP2=" http2"; HTTP2_DIRECTIVE=":"
+fi
+
+TARGET="$NGINX_DIR/sites-available/$NEWDOMAIN.conf"
+LINK="$NGINX_DIR/sites-enabled/$NEWDOMAIN.conf"
+LIVE="$LE_DIR/live/$NEWDOMAIN"
 
 # ---------------------------------------------------------------------------
 # 1. Is the DNS actually pointing here yet?
@@ -71,23 +97,29 @@ case " $(getent ahostsv4 "www.$NEWDOMAIN" 2>/dev/null | awk '{print $1}' | sort 
   *) note "www.$NEWDOMAIN does NOT point here - it will be left out of the certificate" ;;
 esac
 
+SERVER_NAMES="$NEWDOMAIN"
+[ "$WWW_OK" = yes ] && SERVER_NAMES="$NEWDOMAIN www.$NEWDOMAIN"
+
 # ---------------------------------------------------------------------------
 # 2. Read the working site's configuration and take its upstream from it.
 # ---------------------------------------------------------------------------
 say "Reading the configuration of $TEMPLATE"
 
 SRC=""
-for d in /etc/nginx/sites-enabled /etc/nginx/sites-available /etc/nginx/conf.d; do
+for d in "$NGINX_DIR/sites-enabled" "$NGINX_DIR/sites-available" "$NGINX_DIR/conf.d"; do
   for f in "$d/$TEMPLATE.conf" "$d/$TEMPLATE"; do
     [ -f "$f" ] && { SRC="$f"; break 2; }
   done
 done
 if [ -z "$SRC" ]; then
-  SRC=$(sudo grep -rls "server_name[^;]*$TEMPLATE" /etc/nginx 2>/dev/null | head -1)
+  # The file is not named after the site. Find whichever file declares it -
+  # skipping our own output, or re-running this would copy from itself.
+  SRC=$(sudo grep -rls -- "server_name[^;]*$TEMPLATE" "$NGINX_DIR" 2>/dev/null \
+        | grep -v -- "/$NEWDOMAIN.conf$" | head -1)
 fi
 if [ -z "$SRC" ]; then
   bad "Could not find an nginx file for $TEMPLATE on this machine."
-  note "Send me the output of:   ls /etc/nginx/sites-enabled"
+  note "Send me the output of:   ls $NGINX_DIR/sites-enabled"
   note "Nothing has been changed."
   exit 1
 fi
@@ -101,10 +133,19 @@ if [ -z "$UPSTREAM" ]; then
 fi
 ok "It forwards to $UPSTREAM"
 
-SERVER_NAMES="$NEWDOMAIN"
-[ "$WWW_OK" = yes ] && SERVER_NAMES="$NEWDOMAIN www.$NEWDOMAIN"
+# Prove the upstream is actually alive before pointing a public name at it.
+UP_CODE=$(curl -s -o /dev/null -w '%{http_code}' --max-time 10 \
+          -H "Host: $TEMPLATE" "$UPSTREAM" 2>/dev/null)
+if [ "$UP_CODE" = "000" ]; then
+  bad "$UPSTREAM did not answer at all - the app behind $TEMPLATE looks down."
+  note "Nothing has been changed. Fix the app first, then run this again."
+  exit 1
+fi
+ok "$UPSTREAM answers $UP_CODE"
 
-TARGET="/etc/nginx/sites-available/$NEWDOMAIN.conf"
+sudo mkdir -p "$ACME_ROOT/.well-known/acme-challenge"
+sudo chmod -R 755 "$ACME_ROOT"
+
 if sudo test -f "$TARGET"; then
   BK="$TARGET.before-$(date +%Y%m%d-%H%M%S)"
   sudo cp "$TARGET" "$BK"
@@ -112,72 +153,159 @@ if sudo test -f "$TARGET"; then
 fi
 
 # ---------------------------------------------------------------------------
-# 3. Write the plain http site. certbot rewrites this file to add https.
+# 3. Write a plain http site first, so the certificate can be fetched over it.
 # ---------------------------------------------------------------------------
-say "Writing $TARGET"
-sudo tee "$TARGET" >/dev/null <<CONF
-# $NEWDOMAIN - written by point-domain.sh, copied from $SRC
-server {
-    listen 80;
-    listen [::]:80;
-    server_name $SERVER_NAMES;
-
-    client_max_body_size 25m;
-
-    location / {
-        proxy_pass $UPSTREAM;
-        proxy_http_version 1.1;
-        proxy_set_header Upgrade \$http_upgrade;
-        proxy_set_header Connection "upgrade";
-        proxy_set_header Host \$host;
-        proxy_set_header X-Real-IP \$remote_addr;
-        proxy_set_header X-Forwarded-For \$proxy_add_x_forwarded_for;
-        proxy_set_header X-Forwarded-Proto \$scheme;
-        proxy_read_timeout 90s;
-    }
+write_conf() {   # $1 = "http" for the pre-certificate version, "https" for the finished one
+  local mode="$1"
+  {
+    echo "# $NEWDOMAIN - written by point-domain.sh, upstream copied from $SRC"
+    echo "# Do not hand-edit. Re-run the script instead; it is safe to repeat."
+    echo "server {"
+    echo "    listen 80;"
+    echo "    server_name $SERVER_NAMES;"
+    echo ""
+    echo "    # Kept on port 80 permanently. Let's Encrypt renews every 60 days"
+    echo "    # over plain http, and a blanket redirect to https breaks that the"
+    echo "    # first time the certificate on 443 is not valid."
+    echo "    location ^~ /.well-known/acme-challenge/ {"
+    echo "        root $ACME_ROOT;"
+    echo "        default_type \"text/plain\";"
+    echo "    }"
+    echo ""
+    if [ "$mode" = https ]; then
+      echo "    location / { return 301 https://\$host\$request_uri; }"
+      echo "}"
+      echo ""
+      echo "server {"
+      echo "    listen 443 ssl$LISTEN_HTTP2;"
+      $HTTP2_DIRECTIVE
+      echo "    server_name $SERVER_NAMES;"
+      echo ""
+      echo "    ssl_certificate     $LIVE/fullchain.pem;"
+      echo "    ssl_certificate_key $LIVE/privkey.pem;"
+      [ -f "$LE_DIR/options-ssl-nginx.conf" ] && \
+        echo "    include $LE_DIR/options-ssl-nginx.conf;"
+      [ -f "$LE_DIR/ssl-dhparams.pem" ] && \
+        echo "    ssl_dhparam $LE_DIR/ssl-dhparams.pem;"
+      echo ""
+    fi
+    echo "    client_max_body_size 25m;"
+    echo ""
+    echo "    location / {"
+    echo "        proxy_pass $UPSTREAM;"
+    echo "        proxy_http_version 1.1;"
+    echo "        proxy_set_header Upgrade \$http_upgrade;"
+    echo "        proxy_set_header Connection \"upgrade\";"
+    echo "        proxy_set_header Host \$host;"
+    echo "        proxy_set_header X-Real-IP \$remote_addr;"
+    echo "        proxy_set_header X-Forwarded-For \$proxy_add_x_forwarded_for;"
+    echo "        proxy_set_header X-Forwarded-Proto \$scheme;"
+    echo "        proxy_read_timeout 90s;"
+    echo "    }"
+    echo "}"
+  } | sudo tee "$TARGET" >/dev/null
+  sudo ln -sfn "$TARGET" "$LINK"
 }
-CONF
-sudo ln -sfn "$TARGET" "/etc/nginx/sites-enabled/$NEWDOMAIN.conf"
-ok "Written and enabled"
 
-say "Testing the nginx configuration before reloading anything"
-if ! sudo nginx -t 2>&1 | sed 's/^/    /'; then
-  bad "nginx rejected the configuration. Removing the new file again."
-  sudo rm -f "/etc/nginx/sites-enabled/$NEWDOMAIN.conf"
-  note "The server is exactly as it was. Send me what nginx printed above."
-  exit 1
-fi
-sudo systemctl reload nginx && ok "nginx reloaded"
+# Put the configuration back exactly as it was and reload, so a rejected config
+# never leaves the proxy in a state the previous one was not already in.
+restore() {
+  if [ -n "${BK:-}" ] && sudo test -f "${BK:-/nonexistent}"; then
+    sudo cp "$BK" "$TARGET"
+  else
+    sudo rm -f "$TARGET" "$LINK"
+  fi
+  $NGINX_TEST >/dev/null 2>&1 && $NGINX_RELOAD >/dev/null 2>&1
+}
+
+apply() {   # $1 = mode, $2 = description for the log
+  write_conf "$1"
+  if ! $NGINX_TEST 2>&1 | sed 's/^/    /'; then
+    bad "nginx rejected the configuration ($2). Putting it back as it was."
+    restore
+    note "The server is exactly as it was. Send me what nginx printed above."
+    exit 1
+  fi
+  $NGINX_RELOAD >/dev/null 2>&1 && ok "nginx reloaded ($2)"
+}
+
+say "Writing $TARGET"
+apply http "plain http for now"
 
 HTTP_CODE=$(curl -s -o /dev/null -w '%{http_code}' --max-time 20 -H "Host: $NEWDOMAIN" "http://127.0.0.1/" 2>/dev/null)
 note "over plain http the new name now answers $HTTP_CODE"
 
 # ---------------------------------------------------------------------------
-# 4. Certificate.
+# 4. Certificate. Only asked for when there is not already a usable one.
 # ---------------------------------------------------------------------------
-say "Asking Let's Encrypt for a certificate"
-if ! command -v certbot >/dev/null 2>&1; then
-  bad "certbot is not installed here."
-  note "The site works on http already. Tell me and I will send the install step."
-  exit 1
-fi
+say "Certificate"
 
-CB_ARGS="--nginx -d $NEWDOMAIN"
-[ "$WWW_OK" = yes ] && CB_ARGS="$CB_ARGS -d www.$NEWDOMAIN"
-# If certbot already has an account on this box, do not ask for an address again.
-if sudo test -d /etc/letsencrypt/accounts; then
-  CB_ARGS="$CB_ARGS --non-interactive --agree-tos --redirect"
+# A certificate that exists but does not cover www is worse than none - the
+# browser warns on the name it is missing. So check the names, not just the file.
+cert_covers_everything() {
+  sudo test -f "$LIVE/fullchain.pem" || return 1
+  local sans
+  sans=$(sudo openssl x509 -in "$LIVE/fullchain.pem" -noout -text 2>/dev/null \
+         | tr ',' '\n' | sed -n 's/.*DNS://p' | tr -d ' ')
+  local n
+  for n in $SERVER_NAMES; do
+    printf '%s\n' "$sans" | grep -qx -- "$n" || return 1
+  done
+  return 0
+}
+
+if cert_covers_everything; then
+  EXP=$(sudo openssl x509 -in "$LIVE/fullchain.pem" -noout -enddate 2>/dev/null | cut -d= -f2)
+  ok "a Let's Encrypt certificate is already here for $SERVER_NAMES, expires $EXP"
+  note "not asking for another one - renewal is automatic"
 else
-  CB_ARGS="$CB_ARGS --non-interactive --agree-tos --redirect --register-unsafely-without-email"
+  if ! command -v certbot >/dev/null 2>&1; then
+    say "Installing certbot"
+    sudo apt-get update -qq >/dev/null 2>&1
+    sudo apt-get install -y -qq certbot >/dev/null 2>&1
+  fi
+  if ! command -v certbot >/dev/null 2>&1; then
+    bad "certbot could not be installed."
+    note "The site works on plain http already, so nothing is broken - it just"
+    note "has no padlock yet. Send me this output."
+    exit 1
+  fi
+
+  CB="--cert-name $NEWDOMAIN -d $NEWDOMAIN"
+  [ "$WWW_OK" = yes ] && CB="$CB -d www.$NEWDOMAIN"
+  sudo test -f "$LIVE/fullchain.pem" && CB="$CB --expand"
+  if sudo test -d "$LE_DIR/accounts"; then
+    CB="$CB --non-interactive --agree-tos"
+  else
+    CB="$CB --non-interactive --agree-tos --register-unsafely-without-email"
+  fi
+
+  # certonly, not --nginx: the configuration above is already exactly right and
+  # certbot's own rewriting of it is what makes this hard to repeat safely.
+  sudo certbot certonly --webroot -w "$ACME_ROOT" $CB \
+       --deploy-hook "systemctl reload nginx" 2>&1 | tail -25 | sed 's/^/    /'
+
+  if ! cert_covers_everything; then
+    bad "No certificate was issued. Leaving the site on plain http."
+    note "It is serving the right site now, it just has no padlock. Send me the"
+    note "whole output above and I will read the reason out of it."
+    exit 1
+  fi
+  ok "certificate issued"
 fi
 
-sudo certbot $CB_ARGS 2>&1 | tail -20 | sed 's/^/    /'
+say "Switching $NEWDOMAIN to https"
+apply https "http redirects to https"
 
 # ---------------------------------------------------------------------------
 # 5. Prove it from outside, the way a visitor sees it.
 # ---------------------------------------------------------------------------
 say "Checking $NEWDOMAIN from outside over https"
 FINAL=$(curl -s -o /dev/null -w '%{http_code}' --max-time 25 "https://$NEWDOMAIN/" 2>/dev/null)
+ISSUER=$(echo | openssl s_client -connect "$NEWDOMAIN:443" -servername "$NEWDOMAIN" 2>/dev/null \
+         | openssl x509 -noout -issuer 2>/dev/null | sed 's/^issuer=//')
+note "certificate now served: ${ISSUER:-could not read}"
+
 if [ "$FINAL" = "200" ]; then
   ok "https://$NEWDOMAIN answers 200 - it is live"
 else
@@ -193,3 +321,4 @@ fi
 
 say "Done"
 note "$TEMPLATE still works exactly as before - nothing was moved, only added."
+note "Run  bash check-domains.sh  any time to see the state of every vanity domain."
