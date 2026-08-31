@@ -337,19 +337,78 @@ apply https "http redirects to https"
 
 # ---------------------------------------------------------------------------
 # 5. Prove it from outside, the way a visitor sees it.
+#
+# Two things were wrong with the first version of this section, and both of them
+# told Glenn something untrue on the same afternoon:
+#
+#   - it checked once, immediately. Seconds after a certificate is issued the
+#     name may still be answering from a cached record somewhere between here
+#     and the outside world, so a single early probe reports 000 on a domain
+#     that is actually fine. getprompthelper.com was live and this said FAIL.
+#   - it accepted 200 as success. A 200 proves something answered, not that the
+#     right site answered. clarityai.ca returned a perfectly healthy 200 while
+#     serving the nginx default welcome page, and this printed "it is live".
+#
+# So: retry before despairing, and compare what came back against what the
+# template serves. If the two pages are not the same site, say so plainly.
 # ---------------------------------------------------------------------------
 say "Checking $NEWDOMAIN from outside over https"
-FINAL=$(curl -s -o /dev/null -w '%{http_code}' --max-time 25 "https://$NEWDOMAIN/" 2>/dev/null)
+
+page_title() {   # $1 = url. Empty when nothing sensible came back.
+  curl -sk --max-time 25 "$1" 2>/dev/null | tr -d '\n' \
+    | sed -n 's/.*<title[^>]*>\([^<]*\)<\/title>.*/\1/p' | head -1 | cut -c1-70
+}
+
+# Overridable so the test suite does not sit through the real waits.
+PROBE_TRIES=${PROBE_TRIES:-5}
+PROBE_SLEEP=${PROBE_SLEEP:-10}
+
+FINAL=000
+attempt=1
+while [ "$attempt" -le "$PROBE_TRIES" ]; do
+  FINAL=$(curl -s -o /dev/null -w '%{http_code}' --max-time 25 "https://$NEWDOMAIN/" 2>/dev/null)
+  [ "$FINAL" != "000" ] && break
+  if [ "$attempt" -lt "$PROBE_TRIES" ]; then
+    note "no answer yet (try $attempt of $PROBE_TRIES) - giving the change a moment to spread"
+    sleep "$PROBE_SLEEP"
+  fi
+  attempt=$((attempt + 1))
+done
+
 ISSUER=$(echo | openssl s_client -connect "$NEWDOMAIN:443" -servername "$NEWDOMAIN" 2>/dev/null \
          | openssl x509 -noout -issuer 2>/dev/null | sed 's/^issuer=//')
 note "certificate now served: ${ISSUER:-could not read}"
 
-if [ "$FINAL" = "200" ]; then
-  ok "https://$NEWDOMAIN answers 200 - it is live"
-else
-  bad "https://$NEWDOMAIN answered $FINAL"
+if [ "$FINAL" != "200" ]; then
+  bad "https://$NEWDOMAIN answered $FINAL after $PROBE_TRIES tries"
   note "Send me this whole output and I will take it from there. The old site at"
   note "$TEMPLATE has not been touched and is still working."
+else
+  # It answers. Now the question that actually matters: is it the right site?
+  NEW_TITLE=$(page_title "https://$NEWDOMAIN/")
+  TMPL_TITLE=$(page_title "https://$TEMPLATE/")
+  note "$NEWDOMAIN shows   ${NEW_TITLE:-(no title)}"
+  note "$TEMPLATE shows   ${TMPL_TITLE:-(no title)}"
+
+  case "$NEW_TITLE" in
+    "Welcome to nginx!"|"Welcome to nginx")
+      bad "It answers, but it is serving the nginx default page, not the site."
+      note "The request is reaching $UPSTREAM, but whatever is listening there"
+      note "does not recognise the name $NEWDOMAIN and is falling back to its"
+      note "own default page. The fix is on that machine, not this one - the"
+      note "name has to be added to the server_name there, or this proxy has to"
+      note "pass the template's name through instead of the visitor's."
+      note "Send me this output. Nothing here needs undoing."
+      ;;
+    "$TMPL_TITLE")
+      ok "https://$NEWDOMAIN answers 200 and serves the same site as $TEMPLATE"
+      ;;
+    *)
+      bad "It answers 200, but with a different page than $TEMPLATE serves."
+      note "That usually means the request is landing on some other site on the"
+      note "way through. Send me this output before telling anyone it is live."
+      ;;
+  esac
 fi
 
 if [ "$WWW_OK" = yes ]; then
