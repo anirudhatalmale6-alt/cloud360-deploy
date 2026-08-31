@@ -234,6 +234,44 @@ say "Building"
 # is a slow, confusing failure later - the app runs as ubuntu24 and cannot write
 # its own cache, and the symptom shows up nowhere near this script.
 OWNER=$(stat -c '%U' "$SITE" 2>/dev/null)
+
+# Before building, make sure the build can actually write where it needs to.
+#
+# An earlier build on this machine ran as root, which left root-owned files
+# inside .next. Next.js starts a build by deleting the previous one, so a build
+# running as the checkout owner dies on the first root-owned file it tries to
+# unlink - EACCES on something like .next/server/app-paths-manifest.json. That
+# reads like a broken app and is really just a stale owner from one old run.
+# Repair it rather than falling back to building as root, because building as
+# root is what created the problem in the first place.
+if [ -n "$OWNER" ] && [ "$OWNER" != "$(id -un)" ]; then
+  STRAY=0
+  for d in "$SITE/.next" "$SITE/node_modules/.cache"; do
+    [ -d "$d" ] || continue
+    n=$(find "$d" ! -user "$OWNER" 2>/dev/null | wc -l)
+    STRAY=$((STRAY + n))
+  done
+  if [ "$STRAY" -gt 0 ]; then
+    note "$STRAY build files are not owned by $OWNER - left over from an older build that ran as root"
+    for d in "$SITE/.next" "$SITE/node_modules/.cache"; do
+      [ -d "$d" ] && sudo chown -R "$OWNER":"$OWNER" "$d" 2>/dev/null
+    done
+    LEFT=0
+    for d in "$SITE/.next" "$SITE/node_modules/.cache"; do
+      [ -d "$d" ] || continue
+      n=$(find "$d" ! -user "$OWNER" 2>/dev/null | wc -l)
+      LEFT=$((LEFT + n))
+    done
+    if [ "$LEFT" -gt 0 ]; then
+      bad "could not hand those files back to $OWNER ($LEFT still wrong)"
+      note "Nothing has been changed and the site is still running exactly as it was."
+      note "Send me this output."
+      exit 1
+    fi
+    ok "handed the build directory back to $OWNER"
+  fi
+fi
+
 if [ "$OWNER" = "$(id -un)" ] || [ -z "$OWNER" ]; then
   BUILD=$(cd "$SITE" && npm run build 2>&1)
 else
