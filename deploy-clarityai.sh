@@ -235,6 +235,10 @@ say "Building"
 # its own cache, and the symptom shows up nowhere near this script.
 OWNER=$(stat -c '%U' "$SITE" 2>/dev/null)
 
+# Whoever the build will actually run as. If the checkout belongs to somebody
+# else we drop to them below; otherwise it is simply us.
+BUILD_USER="${OWNER:-$(id -un)}"
+
 # Before building, make sure the build can actually write where it needs to.
 #
 # An earlier build on this machine ran as root, which left root-owned files
@@ -244,32 +248,43 @@ OWNER=$(stat -c '%U' "$SITE" 2>/dev/null)
 # reads like a broken app and is really just a stale owner from one old run.
 # Repair it rather than falling back to building as root, because building as
 # root is what created the problem in the first place.
-if [ -n "$OWNER" ] && [ "$OWNER" != "$(id -un)" ]; then
-  STRAY=0
+#
+# The first version of this check only ran when the checkout itself belonged to
+# somebody else, and that is exactly the case it never happens in. /var/www/
+# clarityai belongs to ubuntu24, so the check was skipped, and the root-owned
+# files were the ones INSIDE .next. The directory's owner tells you nothing
+# about the owner of the files under it - so look under it every time.
+strays_under() {
+  # Prints how many files below the build directories are not $BUILD_USER's.
+  _n=0
   for d in "$SITE/.next" "$SITE/node_modules/.cache"; do
     [ -d "$d" ] || continue
-    n=$(find "$d" ! -user "$OWNER" 2>/dev/null | wc -l)
-    STRAY=$((STRAY + n))
+    _c=$(find "$d" ! -user "$BUILD_USER" 2>/dev/null | wc -l)
+    _n=$((_n + _c))
   done
-  if [ "$STRAY" -gt 0 ]; then
-    note "$STRAY build files are not owned by $OWNER - left over from an older build that ran as root"
-    for d in "$SITE/.next" "$SITE/node_modules/.cache"; do
-      [ -d "$d" ] && sudo chown -R "$OWNER":"$OWNER" "$d" 2>/dev/null
-    done
-    LEFT=0
-    for d in "$SITE/.next" "$SITE/node_modules/.cache"; do
-      [ -d "$d" ] || continue
-      n=$(find "$d" ! -user "$OWNER" 2>/dev/null | wc -l)
-      LEFT=$((LEFT + n))
-    done
-    if [ "$LEFT" -gt 0 ]; then
-      bad "could not hand those files back to $OWNER ($LEFT still wrong)"
-      note "Nothing has been changed and the site is still running exactly as it was."
-      note "Send me this output."
-      exit 1
-    fi
-    ok "handed the build directory back to $OWNER"
+  printf '%s' "$_n"
+}
+
+STRAY=$(strays_under)
+if [ "$STRAY" -gt 0 ]; then
+  note "$STRAY build files are not owned by $BUILD_USER - left over from an older build that ran as root"
+  # -n so this fails immediately instead of sitting on an invisible password
+  # prompt inside a command substitution, which looks exactly like a hang.
+  for d in "$SITE/.next" "$SITE/node_modules/.cache"; do
+    [ -d "$d" ] && sudo -n chown -R "$BUILD_USER":"$BUILD_USER" "$d" >/dev/null 2>&1
+  done
+  LEFT=$(strays_under)
+  if [ "$LEFT" -gt 0 ]; then
+    bad "could not hand those files back to $BUILD_USER ($LEFT still wrong)"
+    note "Nothing has been changed and the site is still running exactly as it was."
+    note "This needs one command run by hand, and then this script again:"
+    note ""
+    note "    sudo chown -R $BUILD_USER:$BUILD_USER $SITE/.next $SITE/node_modules/.cache"
+    note ""
+    note "It only changes who owns the build cache. It does not touch the site."
+    exit 1
   fi
+  ok "handed the build directory back to $BUILD_USER"
 fi
 
 if [ "$OWNER" = "$(id -un)" ] || [ -z "$OWNER" ]; then
