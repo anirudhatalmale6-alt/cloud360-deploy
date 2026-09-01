@@ -14,8 +14,26 @@
 # Safe to run more than once. Nothing is deleted except the build folder,
 # which is regenerated.
 
-REPORT=/tmp/panel-report.txt
-: > "$REPORT"
+# Needs root - it frees a port, switches user to build, and hands files back.
+if [ "$(id -u)" != 0 ]; then
+  echo "This has to run as root. Run it again as:"
+  echo ""
+  echo "    sudo bash fix-panel.sh"
+  echo ""
+  echo "Nothing has been changed."
+  exit 1
+fi
+
+# A new directory per run. Fixed names in /tmp meant a root-owned log from an
+# earlier run could not be overwritten by a later one - and the later run then
+# quoted the EARLIER run's log as its own explanation. See deploy-automail.sh,
+# where that happened.
+WORK=$(mktemp -d /tmp/panel-run.XXXXXX) || {
+  echo "Could not create a working directory under /tmp. Nothing has been changed."
+  exit 1
+}
+REPORT="$WORK/report.txt"
+: > "$REPORT" || { echo "Could not write to $REPORT. Nothing has been changed."; exit 1; }
 
 say()  { echo "$@"; echo "$@" >> "$REPORT"; }
 hide() { sed -E 's/gh[pous]_[A-Za-z0-9_]*/HIDDEN/g'; }
@@ -47,6 +65,11 @@ cd "$DIR" || exit 1
 
 asowner() { runuser -l "$OWNER" -c "cd '$DIR' && $1"; }
 PM2="npx --yes pm2"
+
+# The build runs as $OWNER and writes its log into $WORK. Owner only - git's
+# chatter can carry an access token.
+chown "$OWNER":"$GROUP" "$WORK" 2>/dev/null
+chmod 750 "$WORK"
 
 PORT=$(grep -oE "PORT \|\| '[0-9]+'" server.js 2>/dev/null | grep -oE '[0-9]+' | head -1)
 [ -z "$PORT" ] && PORT=3000
@@ -115,7 +138,7 @@ FREE_KB=$(df -Pk . | awk 'NR==2{print $4}')
 if [ "$FREE_KB" -lt 2097152 ]; then
   say ""
   say "REPORT BACK - only $((FREE_KB/1024)) MB free, a build needs about 2 GB."
-  say "Nothing was changed. Send me /tmp/panel-report.txt"
+  say "Nothing was changed. Send me the log in $WORK"
   exit 1
 fi
 
@@ -148,15 +171,15 @@ say "6/9  building the panel from scratch"
 if [ -d .git ] && [ -n "$(git remote 2>/dev/null)" ]; then
   git config --global --add safe.directory "$DIR" >/dev/null 2>&1
   BEFORE=$(git rev-parse --short HEAD 2>/dev/null)
-  if asowner 'git pull --ff-only' > /tmp/panel-pull.log 2>&1; then
+  if asowner 'git pull --ff-only' > $WORK/pull.log 2>&1; then
     say "     code $BEFORE -> $(git rev-parse --short HEAD)"
   else
     say "     could not update the code, using what is already here ($BEFORE). Reason:"
-    tail -n 4 /tmp/panel-pull.log | quote
+    tail -n 4 $WORK/pull.log | quote
   fi
 fi
 
-[ -d node_modules ] || asowner 'npm install --no-audit --no-fund' > /tmp/panel-build.log 2>&1
+[ -d node_modules ] || asowner 'npm install --no-audit --no-fund' > $WORK/build.log 2>&1
 
 # A half-finished build folder is exactly what was on this box, and Next will
 # happily build on top of one and leave the gaps in place. Start empty.
@@ -170,19 +193,19 @@ HEAP=$((MEM_MB * 3 / 4))
 say "     building with a ${HEAP} MB memory limit ..."
 
 BUILD="NODE_ENV=production NODE_OPTIONS=--max-old-space-size=$HEAP npx --yes next build"
-if asowner "$BUILD" > /tmp/panel-build.log 2>&1; then
+if asowner "$BUILD" > $WORK/build.log 2>&1; then
   say "     build finished"
 else
   say "     first attempt failed, reinstalling dependencies and trying again ..."
-  asowner 'npm install --no-audit --no-fund' >> /tmp/panel-build.log 2>&1
-  if asowner "$BUILD" >> /tmp/panel-build.log 2>&1; then
+  asowner 'npm install --no-audit --no-fund' >> $WORK/build.log 2>&1
+  if asowner "$BUILD" >> $WORK/build.log 2>&1; then
     say "     build finished on the second attempt"
   else
     say ""
     say "REPORT BACK - the build failed. It ended with:"
-    tail -n 25 /tmp/panel-build.log | quote
+    tail -n 25 $WORK/build.log | quote
     say ""
-    say "Send me /tmp/panel-report.txt - the panel was left stopped."
+    say "Send me the log in $WORK - the panel was left stopped."
     exit 1
   fi
 fi
@@ -200,9 +223,9 @@ if [ "$CHUNKS" -lt 5 ]; then
   say ""
   say "REPORT BACK - the build says it worked but produced almost nothing."
   say "This is the same fault as before and the cause is in the build log."
-  tail -n 30 /tmp/panel-build.log | quote
+  tail -n 30 $WORK/build.log | quote
   say ""
-  say "Send me /tmp/panel-report.txt - the panel was left stopped."
+  say "Send me the log in $WORK - the panel was left stopped."
   exit 1
 fi
 
@@ -237,7 +260,7 @@ if [ "$HOME_CODE" != "200" ] && [ "$HOME_CODE" != "307" ] && [ "$HOME_CODE" != "
   L=$(ls -1t "/home/$OWNER/.pm2/logs/"*cloud360-panel-error*.log /root/.pm2/logs/*cloud360-panel-error*.log 2>/dev/null | head -1)
   [ -n "$L" ] && tail -n 20 "$L" | quote
   say ""
-  say "REPORT BACK - send me /tmp/panel-report.txt"
+  say "REPORT BACK - send me the log in $WORK"
   exit 1
 fi
 
@@ -280,6 +303,6 @@ if [ "$BAD" -eq 0 ] && [ "$OK" -gt 0 ] && [ "$LOGIN" = "200" ] && [ -z "$WARN" ]
 else
   say "PARTLY FIXED - $OK files served, $BAD failing."
   [ -n "$WARN" ] && { say "Still wrong:"; echo "$WARN" | sed '/^$/d' | tee -a "$REPORT"; }
-  say "Send me /tmp/panel-report.txt"
+  say "Send me the log in $WORK"
 fi
 say "--------------------- TO HERE --------------------------"

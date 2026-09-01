@@ -5,6 +5,15 @@
 #
 # Safe to run more than once.
 
+# Git's error messages go in a directory made fresh for this run. They used to
+# go to fixed names in /tmp, where a leftover file from an earlier run - or one
+# owned by another user - gets read back as if it belonged to this one.
+WORK=$(mktemp -d /tmp/panel-deploy.XXXXXX) || {
+  echo "Could not create a working directory under /tmp. Nothing has been changed."
+  exit 1
+}
+trap 'rm -rf "$WORK"' EXIT
+
 echo "1/5  finding the panel folder ..."
 DIR=""
 for base in /opt /root /home /srv /var/www /usr/local; do
@@ -35,26 +44,26 @@ if [ -z "$(git remote)" ]; then
   exit 1
 fi
 BEFORE=$(git rev-parse --short HEAD 2>/dev/null)
-if ! git fetch --quiet 2>/tmp/panel-fetch-err; then
+if ! git fetch --quiet 2>$WORK/fetch-err; then
   echo ""
   echo "REPORT BACK - could not reach the code repository. The remotes on this box are:"
   git remote
   echo "and the error was:"
-  sed -E 's/gh[pous]_[A-Za-z0-9_]*/HIDDEN/g' /tmp/panel-fetch-err
-  rm -f /tmp/panel-fetch-err
+  sed -E 's/gh[pous]_[A-Za-z0-9_]*/HIDDEN/g' $WORK/fetch-err
+  rm -f $WORK/fetch-err
   exit 1
 fi
-rm -f /tmp/panel-fetch-err
+rm -f $WORK/fetch-err
 
 echo "3/5  updating the code ..."
-if ! git pull --ff-only 2>/tmp/panel-pull-err; then
+if ! git pull --ff-only 2>$WORK/pull-err; then
   echo ""
   echo "REPORT BACK - the update would not apply cleanly. Nothing was changed. The reason was:"
-  sed -E 's/gh[pous]_[A-Za-z0-9_]*/HIDDEN/g' /tmp/panel-pull-err
-  rm -f /tmp/panel-pull-err
+  sed -E 's/gh[pous]_[A-Za-z0-9_]*/HIDDEN/g' $WORK/pull-err
+  rm -f $WORK/pull-err
   exit 1
 fi
-rm -f /tmp/panel-pull-err
+rm -f $WORK/pull-err
 AFTER=$(git rev-parse --short HEAD 2>/dev/null)
 echo "     $BEFORE -> $AFTER"
 

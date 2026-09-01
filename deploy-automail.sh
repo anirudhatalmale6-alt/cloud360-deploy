@@ -8,8 +8,31 @@
 # It looks at the database change BEFORE applying it and refuses to run if
 # anything in it would delete data. Safe to run more than once.
 
-REPORT=/tmp/automail-report.txt
-: > "$REPORT"
+# This needs root: it switches user to run the build, hands files back to their
+# owner, and installs a timer. Run without it and every one of those fails
+# separately, twelve lines apart, and none of them says the actual reason.
+if [ "$(id -u)" != 0 ]; then
+  echo "This has to run as root. Run it again as:"
+  echo ""
+  echo "    sudo bash deploy-automail.sh"
+  echo ""
+  echo "Nothing has been changed."
+  exit 1
+fi
+
+# Every log this run writes goes in its own new directory.
+#
+# They used to be fixed names in /tmp. A run as root left them owned by root,
+# the next run as an ordinary user could not write them - and then printed the
+# PREVIOUS run's log as the explanation for this run's failure. That is worse
+# than no log at all: it was a real git pull, with a real file count, belonging
+# to a different day. A fresh directory per run cannot do that.
+WORK=$(mktemp -d /tmp/automail-run.XXXXXX) || {
+  echo "Could not create a working directory under /tmp. Nothing has been changed."
+  exit 1
+}
+REPORT="$WORK/report.txt"
+: > "$REPORT" || { echo "Could not write to $REPORT. Nothing has been changed."; exit 1; }
 
 say()  { echo "$@"; echo "$@" >> "$REPORT"; }
 hide() { sed -E 's/gh[pous]_[A-Za-z0-9_]*/HIDDEN/g'; }
@@ -43,6 +66,12 @@ cd "$DIR" || exit 1
 
 asowner() { runuser -l "$OWNER" -c "cd '$DIR' && $1"; }
 
+# mktemp made this readable by root only, and some of the work below runs as
+# $OWNER and writes into it. Opened to $OWNER and nobody else - git's own
+# chatter can carry an access token, so this does not become world-readable.
+chown "$OWNER":"$GROUP" "$WORK" 2>/dev/null
+chmod 750 "$WORK"
+
 say "     disk    $(df -Ph . | awk 'NR==2{print $4" free of "$2}')"
 say "     memory  $(free -m | awk '/^Mem/{print $7" MB available of "$2" MB"}')"
 say "     node    $(node -v 2>/dev/null || echo unknown)"
@@ -64,11 +93,11 @@ if [ ! -d .git ] || [ -z "$(git remote 2>/dev/null)" ]; then
 fi
 git config --global --add safe.directory "$DIR" >/dev/null 2>&1
 BEFORE=$(git rev-parse --short HEAD 2>/dev/null)
-if asowner 'git pull --ff-only' > /tmp/automail-pull.log 2>&1; then
+if asowner 'git pull --ff-only' > $WORK/pull.log 2>&1; then
   say "     code $BEFORE -> $(git rev-parse --short HEAD)"
 else
   say "REPORT BACK - could not fetch the new code. Reason:"
-  tail -n 6 /tmp/automail-pull.log | quote
+  tail -n 6 $WORK/pull.log | quote
   exit 1
 fi
 
@@ -121,38 +150,40 @@ fi
 # --------------------------------------------------------- database change
 say ""
 say "4/9  working out what the database needs"
-asowner 'npx --yes prisma generate' > /tmp/automail-prisma.log 2>&1 \
-  || { say "REPORT BACK - prisma generate failed:"; tail -n 15 /tmp/automail-prisma.log | quote; exit 1; }
+asowner 'npx --yes prisma generate' > $WORK/prisma.log 2>&1 \
+  || { say "REPORT BACK - prisma generate failed:"; tail -n 15 $WORK/prisma.log | quote; exit 1; }
 
-if ! asowner 'npx --yes prisma migrate diff --from-config-datasource --to-schema prisma/schema.prisma --script > /tmp/automail-migration.sql' 2>/tmp/automail-diff.log; then
+# Double quotes, so $WORK is this script's directory and not an empty variable
+# inside the other user's shell - which would have written to /migration.sql.
+if ! asowner "npx --yes prisma migrate diff --from-config-datasource --to-schema prisma/schema.prisma --script > $WORK/migration.sql" 2>$WORK/diff.log; then
   say "REPORT BACK - could not work out the database change:"
-  tail -n 15 /tmp/automail-diff.log | quote
+  tail -n 15 $WORK/diff.log | quote
   exit 1
 fi
 
-if [ ! -s /tmp/automail-migration.sql ]; then
+if [ ! -s $WORK/migration.sql ]; then
   say "     nothing to change - the database is already up to date"
 else
   # Anything that removes data stops this script. An additive change adds
   # columns and a table; it never drops or empties one.
-  DANGER=$(grep -icE 'DROP TABLE|DROP COLUMN|DROP DATABASE|DROP SCHEMA|TRUNCATE|ALTER TABLE [^;]*DROP ' /tmp/automail-migration.sql)
-  ADDS=$(grep -cE 'ADD COLUMN|CREATE TABLE|CREATE INDEX|CREATE TYPE|ADD VALUE' /tmp/automail-migration.sql)
+  DANGER=$(grep -icE 'DROP TABLE|DROP COLUMN|DROP DATABASE|DROP SCHEMA|TRUNCATE|ALTER TABLE [^;]*DROP ' $WORK/migration.sql)
+  ADDS=$(grep -cE 'ADD COLUMN|CREATE TABLE|CREATE INDEX|CREATE TYPE|ADD VALUE' $WORK/migration.sql)
   say "     $ADDS additions, $DANGER changes that would remove data"
   if [ "$DANGER" -ne 0 ]; then
     say ""
     say "REPORT BACK - the database change would delete something. Stopping."
     say "Nothing was changed. The change it wanted to make was:"
-    grep -iE 'DROP|TRUNCATE' /tmp/automail-migration.sql | head -n 10 | quote
+    grep -iE 'DROP|TRUNCATE' $WORK/migration.sql | head -n 10 | quote
     exit 1
   fi
 
   say ""
   say "5/9  applying it"
-  if asowner 'npx --yes prisma db execute --file /tmp/automail-migration.sql' > /tmp/automail-apply.log 2>&1; then
+  if asowner "npx --yes prisma db execute --file $WORK/migration.sql" > $WORK/apply.log 2>&1; then
     say "     applied"
   else
     say "REPORT BACK - the database change failed:"
-    tail -n 15 /tmp/automail-apply.log | quote
+    tail -n 15 $WORK/apply.log | quote
     exit 1
   fi
 fi
@@ -170,8 +201,8 @@ say "6/9  building"
 # Swallowing find's error would turn "I could not check" into "nothing wrong",
 # which is the same answer a clean tree gives and the reason this needs saying.
 strays() {
-  if find node_modules ! -user "$OWNER" > /tmp/automail-stray.txt 2>/tmp/automail-stray.err; then
-    wc -l < /tmp/automail-stray.txt
+  if find node_modules ! -user "$OWNER" > $WORK/stray.txt 2>$WORK/stray.err; then
+    wc -l < $WORK/stray.txt
   else
     echo BROKEN
   fi
@@ -181,7 +212,7 @@ if [ -d node_modules ]; then
   STRAY=$(strays)
   if [ "$STRAY" = BROKEN ]; then
     say "REPORT BACK - could not check who owns the files under node_modules."
-    tail -n 3 /tmp/automail-stray.err | quote
+    tail -n 3 $WORK/stray.err | quote
     say "Nothing has been changed and AutoMail is still running as it was."
     exit 1
   fi
@@ -199,7 +230,7 @@ if [ -d node_modules ]; then
   fi
 fi
 
-[ -d node_modules ] || asowner 'npm install --no-audit --no-fund' > /tmp/automail-build.log 2>&1
+[ -d node_modules ] || asowner 'npm install --no-audit --no-fund' > $WORK/build.log 2>&1
 
 rm -rf .next
 MEM_MB=$(free -m | awk '/^Mem/{print $2}')
@@ -208,16 +239,16 @@ HEAP=$((MEM_MB * 3 / 4))
 [ "$HEAP" -gt 4096 ] && HEAP=4096
 
 BUILD="NODE_ENV=production NODE_OPTIONS=--max-old-space-size=$HEAP npx --yes next build"
-if asowner "$BUILD" > /tmp/automail-build.log 2>&1; then
+if asowner "$BUILD" > $WORK/build.log 2>&1; then
   say "     build finished"
 else
   say "     first attempt failed, reinstalling dependencies and trying again ..."
-  asowner 'npm install --no-audit --no-fund' >> /tmp/automail-build.log 2>&1
-  if asowner "$BUILD" >> /tmp/automail-build.log 2>&1; then
+  asowner 'npm install --no-audit --no-fund' >> $WORK/build.log 2>&1
+  if asowner "$BUILD" >> $WORK/build.log 2>&1; then
     say "     build finished on the second attempt"
   else
     say "REPORT BACK - the build failed. It ended with:"
-    tail -n 25 /tmp/automail-build.log | quote
+    tail -n 25 $WORK/build.log | quote
     exit 1
   fi
 fi
@@ -225,7 +256,7 @@ fi
 CHUNKS=$(find .next/static/chunks -type f -name '*.js' 2>/dev/null | wc -l)
 if [ "$CHUNKS" -lt 5 ]; then
   say "REPORT BACK - the build produced almost nothing ($CHUNKS files)."
-  tail -n 25 /tmp/automail-build.log | quote
+  tail -n 25 $WORK/build.log | quote
   exit 1
 fi
 say "     $CHUNKS files built"
@@ -309,6 +340,6 @@ if [ -z "$WARN" ]; then
 else
   say "PARTLY DONE. Still wrong:"
   echo "$WARN" | sed '/^$/d' | tee -a "$REPORT"
-  say "Send me /tmp/automail-report.txt"
+  say "The full log of this run is in $WORK"
 fi
 say "--------------------- TO HERE --------------------------"
