@@ -76,6 +76,13 @@ if [ ! -f src/lib/campaign-sender.ts ]; then
   say "REPORT BACK - the new scheduler is not in the code that was pulled."
   exit 1
 fi
+# The named report for the read-only login. Checked by name so a pull that
+# quietly did nothing is caught here rather than after a ten-minute build.
+if [ ! -f src/app/api/reports/engagement/route.ts ]; then
+  say "REPORT BACK - the named campaign report is not in the code that was pulled."
+  say "That means this folder is behind. Nothing has been changed."
+  exit 1
+fi
 
 # ------------------------------------------------------------- the settings
 # Two settings are needed. Both are generated here and written straight into
@@ -153,6 +160,45 @@ fi
 # ------------------------------------------------------------------- build
 say ""
 say "6/9  building"
+
+# One build run as root leaves root-owned files behind, and every later build
+# as $OWNER then dies trying to overwrite them. .next is deleted outright below
+# so it cannot bite here, but node_modules is not - and npm install as $OWNER
+# into a root-owned tree fails in a way that reads like a broken package.
+# We are root at this point, so this is just a chown; no password, no prompt.
+# Counted through a function that refuses to answer 0 when find itself failed.
+# Swallowing find's error would turn "I could not check" into "nothing wrong",
+# which is the same answer a clean tree gives and the reason this needs saying.
+strays() {
+  if find node_modules ! -user "$OWNER" > /tmp/automail-stray.txt 2>/tmp/automail-stray.err; then
+    wc -l < /tmp/automail-stray.txt
+  else
+    echo BROKEN
+  fi
+}
+
+if [ -d node_modules ]; then
+  STRAY=$(strays)
+  if [ "$STRAY" = BROKEN ]; then
+    say "REPORT BACK - could not check who owns the files under node_modules."
+    tail -n 3 /tmp/automail-stray.err | quote
+    say "Nothing has been changed and AutoMail is still running as it was."
+    exit 1
+  fi
+  if [ "$STRAY" -gt 0 ]; then
+    say "     $STRAY files under node_modules are not owned by $OWNER - handing them back"
+    chown -R "$OWNER":"$GROUP" node_modules >/dev/null 2>&1
+    # Count again rather than trusting the exit code above.
+    LEFT=$(strays)
+    if [ "$LEFT" != 0 ]; then
+      say "REPORT BACK - $LEFT files under node_modules still belong to somebody else."
+      say "Nothing has been changed and AutoMail is still running as it was."
+      exit 1
+    fi
+    say "     handed back"
+  fi
+fi
+
 [ -d node_modules ] || asowner 'npm install --no-audit --no-fund' > /tmp/automail-build.log 2>&1
 
 rm -rf .next
