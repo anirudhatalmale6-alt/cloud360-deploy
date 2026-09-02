@@ -331,6 +331,32 @@ for path in "/" "/book" "/privacy" "/terms" "/quiz" "/clarityai-safety-guide.pdf
   if [ "$CODE" = "200" ]; then ok "$path"; else bad "$path answered $CODE"; FAILED=1; fi
 done
 
+say "Checking the site can be found and shared"
+# These four are what search engines and Facebook ask for. They are easy to
+# lose in a rebuild and nothing on the site looks wrong when they are missing,
+# so they get checked rather than assumed. A 200 on an image only proves the
+# file exists, so the two text ones are read as well.
+for path in "/robots.txt" "/sitemap.xml" "/icon.png" "/apple-icon.png" "/opengraph-image.png"; do
+  CODE=$(curl -s -o /dev/null -w '%{http_code}' --max-time 25 "$PUBLIC$path" 2>/dev/null)
+  if [ "$CODE" = "200" ]; then ok "$path"; else bad "$path answered $CODE"; FAILED=1; fi
+done
+
+SITEMAP=$(curl -s --max-time 25 "$PUBLIC/sitemap.xml" 2>/dev/null)
+COUNT=$(printf '%s' "$SITEMAP" | grep -o '<loc>' | wc -l | tr -d ' ')
+if [ "${COUNT:-0}" -ge 5 ] && printf '%s' "$SITEMAP" | grep -q 'clarityai.ca'; then
+  ok "sitemap lists $COUNT pages, all on clarityai.ca"
+else
+  bad "the sitemap has $COUNT pages in it, or the wrong address"
+  FAILED=1
+fi
+
+if curl -s --max-time 25 "$PUBLIC/robots.txt" 2>/dev/null | grep -qi 'sitemap'; then
+  ok "robots.txt points crawlers at the sitemap"
+else
+  bad "robots.txt does not mention the sitemap - crawlers will not find it"
+  FAILED=1
+fi
+
 say "Checking that no button still goes nowhere"
 DEAD=$(curl -s --max-time 25 "$PUBLIC/" 2>/dev/null | grep -o 'href="#"' | wc -l | tr -d ' ')
 if [ "$DEAD" = "0" ]; then ok "none left"; else bad "$DEAD links on the home page still go nowhere"; FAILED=1; fi
