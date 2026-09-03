@@ -60,28 +60,79 @@ sudo tar czf "$BK" -C "$SITE" . 2>/dev/null && ok "Current site backed up to $BK
 say "Trying git first"
 USED_GIT=no
 if sudo test -d "$SITE/.git"; then
-  BEFORE=$(sudo git -C "$SITE" rev-parse --short HEAD 2>/dev/null)
-  BRANCH=$(sudo git -C "$SITE" rev-parse --abbrev-ref HEAD 2>/dev/null)
-  note "on branch $BRANCH at $BEFORE"
+  # Run git as whoever owns the checkout - NOT as root.
+  #
+  # Every git call here used to be `sudo git`. That is precisely what left
+  # root-owned files inside the ClarityAI checkout's .git on VM 138, and the
+  # next run as the ordinary user died half way through a fetch with
+  # "insufficient permission for adding an object to repository database".
+  # Running as root makes each deploy look fine and leaves the next one worse.
+  #
+  # It also has to be settled BEFORE the fetch. Asking "can git read this?" and
+  # using the answer to decide who writes to it is two different questions -
+  # reading succeeds right up until the moment objects have to be written.
+  OWNER=$(stat -c '%U' "$SITE" 2>/dev/null); [ -n "$OWNER" ] || OWNER=$(id -un)
+  GIT_RUN=""
+  GIT_OK=yes
+  if [ "$OWNER" != "$(id -un)" ]; then
+    if sudo -n -u "$OWNER" -H true 2>/dev/null; then
+      GIT_RUN="sudo -n -u $OWNER -H"
+      note "running git as $OWNER, who owns the checkout"
+    else
+      GIT_OK=no
+      note "the checkout belongs to $OWNER and this login cannot become $OWNER"
+    fi
+  fi
+
   # `sudo VAR=x cmd` is not a thing - sudo would look for a command called
   # "VAR=x". It has to go through env, or the prompt-suppression silently does
   # not happen and we are back to a hung terminal.
-  #
-  # fetch then fast-forward, rather than pull. A plain pull on a checkout that
-  # has drifted stops with "Need to specify how to reconcile divergent
-  # branches" and waits, which is a different failure that looks like the same
-  # one. Fast-forward or nothing.
-  PULL=$(sudo env GIT_TERMINAL_PROMPT=0 GIT_ASKPASS=/bin/true \
-           git -C "$SITE" fetch origin "$BRANCH" 2>&1) && \
-  PULL="$PULL"$'\n'$(sudo git -C "$SITE" merge --ff-only FETCH_HEAD 2>&1)
-  RC=$?
-  # Strip anything that looks like a credential out of git's chatter before it
-  # reaches the screen.
-  echo "$PULL" | sed -E 's#https://[^@/]*@#https://#g; s/gh[pous]_[A-Za-z0-9_]*/***/g' | sed 's/^/    /'
-  if [ $RC -eq 0 ]; then
-    USED_GIT=yes
-    ok "pulled, now at $(sudo git -C "$SITE" rev-parse --short HEAD)"
+  git_at() { $GIT_RUN env GIT_TERMINAL_PROMPT=0 GIT_ASKPASS=/bin/true git -C "$SITE" "$@" 2>&1; }
+  strays() { find "$SITE/.git" ! -user "$OWNER" 2>/dev/null | wc -l | tr -d ' '; }
+
+  if [ "$GIT_OK" = yes ]; then
+    # Anything under .git owned by somebody else stops the fetch part way
+    # through. Count it now, hand it back, and check that it worked - rather
+    # than finding out after the network transfer.
+    N=$(strays)
+    if [ "${N:-0}" -gt 0 ]; then
+      note "$N files inside .git do not belong to $OWNER - left by an older run as root"
+      GROUP=$(id -gn "$OWNER" 2>/dev/null || printf '%s' "$OWNER")
+      sudo -n chown -R "$OWNER":"$GROUP" "$SITE/.git" >/dev/null 2>&1
+      if [ "$(strays)" -gt 0 ]; then
+        GIT_OK=no
+        note "could not hand those files back, so a fetch would fail part way through"
+        note "to repair it by hand:  sudo chown -R $OWNER:$GROUP $SITE/.git"
+      else
+        ok "handed .git back to $OWNER"
+      fi
+    fi
+  fi
+
+  if [ "$GIT_OK" = no ]; then
+    note "Skipping git and using the direct download instead, which needs none of this."
+    PULL=""
+    RC=1
   else
+    BEFORE=$(git_at rev-parse --short HEAD)
+    BRANCH=$(git_at rev-parse --abbrev-ref HEAD)
+    note "on branch $BRANCH at $BEFORE"
+    # fetch then fast-forward, rather than pull. A plain pull on a checkout that
+    # has drifted stops with "Need to specify how to reconcile divergent
+    # branches" and waits, which is a different failure that looks like the same
+    # one. Fast-forward or nothing.
+    PULL=$(git_at fetch origin "$BRANCH") && \
+    PULL="$PULL"$'\n'$(git_at merge --ff-only FETCH_HEAD)
+    RC=$?
+    # Strip anything that looks like a credential out of git's chatter before it
+    # reaches the screen.
+    echo "$PULL" | sed -E 's#https://[^@/]*@#https://#g; s/gh[pous]_[A-Za-z0-9_]*/***/g' | sed 's/^/    /'
+  fi
+
+  if [ $RC -eq 0 ] && [ "$GIT_OK" = yes ]; then
+    USED_GIT=yes
+    ok "pulled, now at $(git_at rev-parse --short HEAD)"
+  elif [ "$GIT_OK" = yes ]; then
     # Say what actually went wrong. Announcing "authentication" for what was
     # really a divergent branch sends the next hour in the wrong direction.
     case "$PULL" in
@@ -90,6 +141,12 @@ if sudo test -d "$SITE/.git"; then
         note "accepted by GitHub." ;;
       *"Not possible to fast-forward"*|*"divergent"*|*"local changes"*|*"would be overwritten"*)
         note "this checkout has drifted from GitHub, so a clean fast-forward is not possible." ;;
+      *"insufficient permission"*|*"unpack-objects failed"*|*"Permission denied"*)
+        note "git could read the checkout but not write to it. Some file it needs to touch"
+        note "belongs to another user - the check above should have repaired that, so send"
+        note "me this output and I will find the one it missed." ;;
+      *"dubious ownership"*)
+        note "git is refusing because the checkout belongs to somebody else." ;;
       *)
         note "git did not succeed - see its own words above." ;;
     esac
