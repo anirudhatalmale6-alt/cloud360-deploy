@@ -52,37 +52,74 @@ pm2cmd() { command -v pm2 >/dev/null 2>&1 && pm2 "$@" 2>/dev/null || sudo -u ubu
 scrub() { sed -E 's#https://[^@/]*@#https://#g; s/gh[pous]_[A-Za-z0-9_]{6,}/***/g'; }
 
 # ---------------------------------------------------------------------------
-# Run git against the checkout, without sudo if that works.
+# Run git against the checkout, as whoever owns it.
 #
-# The old version put sudo in front of every git call. That is worse than it
-# looks. When the checkout belongs to ubuntu24 and git runs as root, git refuses
-# with "detected dubious ownership" - and the script read that failure as "this
-# is not a git checkout", which is a different fault with a different fix and
-# sent the whole diagnosis down the wrong road.
+# Version one put sudo in front of every git call. That is worse than it looks.
+# When the checkout belongs to ubuntu24 and git runs as root, git refuses with
+# "detected dubious ownership" - and the script read that failure as "this is
+# not a git checkout", which is a different fault with a different fix and sent
+# the whole diagnosis down the wrong road.
 #
-# Try as the current user first, because that is usually who owns it, and only
-# reach for sudo if that genuinely cannot see the repository.
+# Version two asked "can I READ this repository?" and used the answer to decide
+# who should WRITE to it. Those are two different questions. On VM 138 git read
+# the checkout perfectly well as ubuntu24 and then died in the middle of the
+# fetch with
+#
+#     error: insufficient permission for adding an object to repository database
+#     fatal: unpack-objects failed
+#
+# because an older run had left root-owned files inside .git. No read test can
+# ever see that coming, and finding out half way through a fetch is the worst
+# moment to find out.
+#
+# So: work out who owns the checkout, run git as them, and settle the write
+# question before starting - by repairing it, because root-owned files in a
+# ubuntu24 checkout are the fault, not something to work around by escalating
+# to root and leaving even more of them behind for next time.
 # ---------------------------------------------------------------------------
-GIT_PREFIX=""
-git_at() {
-  if [ -z "$GIT_PREFIX" ]; then
-    git -C "$SITE" "$@" 2>&1
-  else
-    sudo env GIT_TERMINAL_PROMPT=0 GIT_ASKPASS=/bin/true git -C "$SITE" "$@" 2>&1
-  fi
+GIT_RUN=""          # empty = run it directly, otherwise a sudo prefix
+OWNER=""
+
+as_owner() {
+  if [ -z "$GIT_RUN" ]; then "$@"; else $GIT_RUN "$@"; fi
 }
+
+git_at() {
+  as_owner env GIT_TERMINAL_PROMPT=0 GIT_ASKPASS=/bin/true git -C "$SITE" "$@" 2>&1
+}
+
+# How many files under .git do not belong to the user git will run as. Anything
+# above zero means a fetch can fail part way through.
+git_strays() {
+  find "$SITE/.git" ! -user "$OWNER" 2>/dev/null | wc -l | tr -d ' '
+}
+
 choose_git() {
-  if git -C "$SITE" rev-parse --git-dir >/dev/null 2>&1; then
-    GIT_PREFIX=""; return 0
+  OWNER=$(stat -c '%U' "$SITE" 2>/dev/null)
+  [ -n "$OWNER" ] || OWNER=$(id -un)
+
+  if [ ! -d "$SITE/.git" ]; then
+    bad "$SITE is not a git checkout, so there is nothing to pull."
+    note "Tell me and I will send you a different way to get the files across."
+    note "Nothing has been changed and the site is still running exactly as it was."
+    exit 1
   fi
-  if sudo -n git -C "$SITE" rev-parse --git-dir >/dev/null 2>&1; then
-    GIT_PREFIX="sudo"; note "using sudo for git - the checkout is not owned by $(id -un)"; return 0
+
+  if [ "$OWNER" = "$(id -un)" ]; then
+    GIT_RUN=""
+  elif sudo -n -u "$OWNER" true 2>/dev/null; then
+    GIT_RUN="sudo -n -u $OWNER -H"
+    note "running git as $OWNER, who owns the checkout"
+  else
+    bad "the checkout at $SITE belongs to $OWNER, and this login cannot become $OWNER."
+    note "Log in as $OWNER and run this script again."
+    note "Nothing has been changed and the site is still running exactly as it was."
+    exit 1
   fi
-  # Neither worked. Say which of the two possible reasons it is, rather than
-  # asserting the checkout does not exist.
-  if [ -d "$SITE/.git" ]; then
+
+  if ! git_at rev-parse --git-dir >/dev/null 2>&1; then
     bad "$SITE has a .git directory but git will not read it."
-    WHY=$(git -C "$SITE" rev-parse --git-dir 2>&1 | head -2)
+    WHY=$(git_at rev-parse --git-dir | head -2)
     printf '%s\n' "$WHY" | scrub | sed 's/^/    /'
     case "$WHY" in
       *"dubious ownership"*)
@@ -91,12 +128,47 @@ choose_git() {
         note "    git config --global --add safe.directory $SITE" ;;
       *) note "Send me the two lines above." ;;
     esac
-  else
-    bad "$SITE is not a git checkout, so there is nothing to pull."
-    note "Tell me and I will send you a different way to get the files across."
+    note "Nothing has been changed and the site is still running exactly as it was."
+    exit 1
   fi
-  note "Nothing has been changed and the site is still running exactly as it was."
-  exit 1
+
+  # Reading works. Now the question that actually decides whether a fetch can
+  # finish.
+  STRAY=$(git_strays)
+  if [ "${STRAY:-0}" -gt 0 ]; then
+    note "$STRAY files inside .git do not belong to $OWNER - left behind by an older run as root"
+    GROUP=$(id -gn "$OWNER" 2>/dev/null || printf '%s' "$OWNER")
+    sudo -n chown -R "$OWNER":"$GROUP" "$SITE/.git" >/dev/null 2>&1
+    LEFT=$(git_strays)
+    if [ "${LEFT:-0}" -gt 0 ]; then
+      bad "could not hand those files back to $OWNER - $LEFT are still wrong."
+      note "git can read this checkout but cannot write to it, so the fetch would"
+      note "stop half way through with 'insufficient permission'."
+      note "Nothing has been changed and the site is still running exactly as it was."
+      note ""
+      note "Run this one command, type your password when it asks, then run this"
+      note "script again. It changes nothing but who owns the repository's own"
+      note "bookkeeping files - it does not touch the site or its settings:"
+      note ""
+      note "    sudo chown -R $OWNER:$GROUP $SITE/.git"
+      note ""
+      exit 1
+    fi
+    ok "handed .git back to $OWNER - the fetch can write now"
+  fi
+
+  # The merge writes into the working tree as well, so a stray owner out there
+  # stops it just as dead. These are not repaired silently - a file outside
+  # .git might be owned by somebody else on purpose - but they are named here,
+  # so if the merge does fail the reason is already on screen.
+  TREE=$(find "$SITE" -maxdepth 3 ! -user "$OWNER" \
+           -not -path "$SITE/.git/*" -not -path "$SITE/node_modules/*" \
+           -not -path "$SITE/.next/*" 2>/dev/null | head -5)
+  if [ -n "$TREE" ]; then
+    note "these files in the checkout belong to somebody other than $OWNER:"
+    printf '%s\n' "$TREE" | sed 's/^/      /'
+    note "if the fetch below stops on a permission, that is the reason."
+  fi
 }
 
 # ---------------------------------------------------------------------------
@@ -213,6 +285,12 @@ if [ $RC -ne 0 ]; then
       note "run this same script with  --set-token  on the end and paste it in."
       note "It is read invisibly and goes nowhere except this checkout's config."
       note "Do not paste it into our chat - I do not need to see it."
+      exit 1 ;;
+    *"insufficient permission"*|*"unpack-objects failed"*|*"Permission denied"*)
+      note "git could read the checkout but not write to it. Some file it needs to"
+      note "touch belongs to another user - almost always root, from an older run."
+      note "The check above should have caught and repaired that, so send me this"
+      note "output and I will find the one it missed."
       exit 1 ;;
     *"Not possible to fast-forward"*|*"divergent"*|*"local changes"*|*"would be overwritten"*)
       note "This checkout has drifted from GitHub, so it cannot fast-forward cleanly." ;;
